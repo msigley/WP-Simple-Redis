@@ -31,17 +31,13 @@ function wp_cache_add( $key, $value, $group = 'default', $expiration = 0 ) {
 }
 
 /**
- * Closes the cache.
- *
- * This function has ceased to do anything since WordPress 2.5. The
- * functionality was removed along with the rest of the persistent cache. This
- * does not mean that plugins can't implement this function when they need to
- * make sure that the cache is cleaned up after WordPress no longer needs it.
+ * Closes the cache. Runs as a PHP shutdown handler.
  *
  * @return  bool    Always returns True
  */
 function wp_cache_close() {
-	return true;
+	global $wp_object_cache;
+	return $wp_object_cache->close();
 }
 
 /**
@@ -266,21 +262,6 @@ class WP_Object_Cache {
 	 */
 	private $multisite;
 
-	// Implementation specific properties
-	/**
-	 * Holds the Redis client.
-	 *
-	 * @var Redis
-	 */
-	private $redis;
-
-	/**
-	 * Track if Redis is available
-	 *
-	 * @var bool
-	 */
-	private $redis_connected = false;
-
 	/**
 	 * List of global cache groups.
 	 *
@@ -289,29 +270,60 @@ class WP_Object_Cache {
 	 */
 	protected $non_persistent_groups = array();
 
+	// Implementation specific properties
+	/**
+	 * Holds the Redis client.
+	 *
+	 * @var Redis
+	 */
+	private static $num_instances = 0;
+
+	/**
+	 * Holds the Redis client.
+	 *
+	 * @var Redis
+	 */
+	private static $redis = null;
+
+	/**
+	 * Track if Redis is available
+	 *
+	 * @var bool
+	 */
+	private static $redis_persistent_id = null;
+
+	/**
+	 * Track if Redis is available
+	 *
+	 * @var bool
+	 */
+	private static $redis_connected = false;
+
 	/**
 	 * Instantiate the Redis class.
 	 *
 	 * @param   null $redis_instance
 	 */
-	public function __construct( $redis_instance = null ) {
+	public function __construct() {
 		// General Redis settings
-		$redis = array(
+		$redis_settings = array(
 			'host' => '127.0.0.1',
 			'port' => 6379,
+			'auth' => false,
+			'database' => 0
 		);
 
 		if ( defined( 'WP_REDIS_BACKEND_HOST' ) && WP_REDIS_BACKEND_HOST ) {
-			$redis['host'] = WP_REDIS_BACKEND_HOST;
+			$redis_settings['host'] = WP_REDIS_BACKEND_HOST;
 		}
 		if ( defined( 'WP_REDIS_BACKEND_PORT' ) && WP_REDIS_BACKEND_PORT ) {
-			$redis['port'] = WP_REDIS_BACKEND_PORT;
+			$redis_settings['port'] = WP_REDIS_BACKEND_PORT;
 		}
 		if ( defined( 'WP_REDIS_BACKEND_AUTH' ) && WP_REDIS_BACKEND_AUTH ) {
-			$redis['auth'] = WP_REDIS_BACKEND_AUTH;
+			$redis_settings['auth'] = WP_REDIS_BACKEND_AUTH;
 		}
 		if ( defined( 'WP_REDIS_BACKEND_DB' ) && WP_REDIS_BACKEND_DB ) {
-			$redis['database'] = WP_REDIS_BACKEND_DB;
+			$redis_settings['database'] = WP_REDIS_BACKEND_DB;
 		}
 
 		/**
@@ -326,31 +338,39 @@ class WP_Object_Cache {
 
 
 		// Use Redis PECL library.
-		try {
-			if ( is_null( $redis_instance ) ) {
-				$redis_instance = new Redis();
-			}
-			$this->redis = $redis_instance;
-			$this->redis->connect( $redis['host'], $redis['port'] );
-			$this->redis->setOption( Redis::OPT_SERIALIZER, Redis::SERIALIZER_NONE );
-			if( !empty( WP_CACHE_KEY_SALT ) )
-				$this->redis->setOption(Redis::OPT_PREFIX, WP_CACHE_KEY_SALT . ':');
+		if( !self::$redis_connected || empty( self::$redis ) ) {
+			try {
+				// Calulate Redis timeout based on the PHP max_execution_time setting.
+				$timeout = ini_get( 'max_execution_time' );
+				if( false === $timeout )
+					$timeout = 30; // Default max_execution_time is 30 seconds.
+				if( empty( $timeout ) )
+					$timeout = 300; // We want all connections to have a timeout.
+				$timeout += 2; // Add a little leeway so we don't have Redis timeout issues with long running scripts.
 
-			if ( isset( $redis['auth'] ) ) {
-				$this->redis->auth( $redis['auth'] );
-			}
+				self::$redis = new Redis();
+				self::$redis->connect( $redis_settings['host'], $redis_settings['port'], $timeout );
+				self::$redis->client( 'setname', uniqid( 'PHP_' . $redis_settings['database'] . '_' . WP_CACHE_KEY_SALT . '_' . $_SERVER['REMOTE_ADDR'] . '_' . $_SERVER['REMOTE_PORT'] . '_', true ) ); // This allows connections to be identified in RedisInsight
 
-			if ( isset( $redis['database'] ) ) {
-				$this->redis->select( $redis['database'] );
-			}
+				self::$redis->setOption( Redis::OPT_SERIALIZER, Redis::SERIALIZER_NONE );
+				if( !empty( WP_CACHE_KEY_SALT ) )
+					self::$redis->setOption( Redis::OPT_PREFIX, WP_CACHE_KEY_SALT . ':' );
 
-			$this->redis_connected = true;
-		} catch ( RedisException $e ) {
-			$this->redis_connected = false;
+				if ( false !== $redis_settings['auth'] )
+					self::$redis->auth( $redis_settings['auth'] );
+
+				self::$redis->select( $redis_settings['database'] );
+
+				self::$redis_connected = true;
+			} catch ( RedisException $e ) {
+				$this->close();
+			}
 		}
 
 		$this->multisite = is_multisite();
 		$this->blog_prefix = $this->multisite ? get_current_blog_id() . ':' : '';
+
+		self::$num_instances++;
 	}
 
 	/**
@@ -362,7 +382,7 @@ class WP_Object_Cache {
 		if( !empty( $group ) && isset( $this->non_persistent_groups[ $group ] ) )
 			false;
 
-		return $this->redis_connected;
+		return self::$redis_connected;
 	}
 
 
@@ -372,15 +392,16 @@ class WP_Object_Cache {
 	 *
 	 * @return bool
 	 */
-	protected function set_redis( $key, $value, $expire = 0 ) {
+	protected function set_redis( $key, $value, $expire = 0, $redis_options = array() ) {
+		if( $expire > 0 )
+			$redis_options['ex'] = $expire;
+
 		$value = @serialize( $value );
 		$compressed_value = @gzcompress( $value, 1, FORCE_DEFLATE );
 		if( false !== $compressed_value )
 			$value = "@$compressed_value"; // @ is our compression marker. The leading character of a php serialized string is never @.
-		if( $expire > 0 )
-			$this->redis->set( $key, $value, $expire );
-		else
-			$this->redis->set( $key, $value );
+
+		self::$redis->set( $key, $value, $redis_options );
 	}
 
 	/**
@@ -390,7 +411,7 @@ class WP_Object_Cache {
 	 * @return bool
 	 */
 	protected function get_redis( $key ) {
-		$value = $this->redis->get( $key );
+		$value = self::$redis->get( $key );
 		if( substr( $value, 0, 1 ) == '@' ) {
 			$decompressed_value = @gzuncompress( substr( $value, 1 ) );
 			if( false !== $decompressed_value )
@@ -476,11 +497,11 @@ class WP_Object_Cache {
 			$id = $this->blog_prefix . $key;
 		}
 
-		if ( $this->_exists( $id, $group ) ) {
+		if ( $this->_exists( $id, $group, false ) ) {
 			return false;
 		}
 
-		return $this->set( $key, $data, $group, (int) $expire );
+		return $this->set( $key, $data, $group, (int) $expire, array( 'nx' ) );
 	}
 
 	/**
@@ -507,6 +528,18 @@ class WP_Object_Cache {
 
 		$groups              = array_fill_keys( $groups, true );
 		$this->non_persistent_groups = array_merge( $this->non_persistent_groups, $groups );
+	}
+
+	/**
+	 * Wrapper for Redis::close.
+	 *
+	 * @return bool
+	 */
+	protected function close() {
+		if( !empty( self::$redis ) ) {
+			self::$redis->close();
+		}
+		self::$redis_connected = false;
 	}
 
 	/**
@@ -544,15 +577,11 @@ class WP_Object_Cache {
 			$key = $this->blog_prefix . $key;
 		}
 
-		if ( ! $this->_exists( $key, $group ) ) {
-			return false;
-		}
-
+		$return = isset( $this->cache[ $group ][ $key ] );
 		unset( $this->cache[ $group ][ $key ] );
-
 		if( $this->can_redis( $group ) )
-			return (bool) $this->redis->del( "$group:$key" );
-		return true;
+			$return = $return || (bool) self::$redis->del( "$group:$key" );
+		return $return;
 	}
 
 	/**
@@ -566,7 +595,7 @@ class WP_Object_Cache {
 		$this->cache = array();
 
 		if ( $this->can_redis() )
-			$this->redis->flushDb();
+			self::$redis->flushDb();
 
 		return true;
 	}
@@ -600,18 +629,16 @@ class WP_Object_Cache {
 			$key = $this->blog_prefix . $key;
 		}
 
-		if ( $this->_exists( $key, $group ) ) {
-			if ( ( $force || !isset( $this->cache[ $group ][ $key ] ) ) && $this->can_redis( $group ) )
-				$this->cache[ $group ][ $key ] = $this->get_redis( "$group:$key" );
+		if ( ( $force || !isset( $this->cache[ $group ][ $key ] ) ) && $this->can_redis( $group ) )
+			$this->cache[ $group ][ $key ] = $this->get_redis( "$group:$key" );
 
-			if ( isset( $this->cache[ $group ][ $key ] ) ) {
-				$found             = true;
-				$this->cache_hits += 1;
-				if ( is_object( $this->cache[ $group ][ $key ] ) ) {
-					return clone $this->cache[ $group ][ $key ];
-				} else {
-					return $this->cache[ $group ][ $key ];
-				}
+		if ( isset( $this->cache[ $group ][ $key ] ) ) {
+			$found             = true;
+			$this->cache_hits += 1;
+			if ( is_object( $this->cache[ $group ][ $key ] ) ) {
+				return clone $this->cache[ $group ][ $key ];
+			} else {
+				return $this->cache[ $group ][ $key ];
 			}
 		}
 
@@ -660,7 +687,7 @@ class WP_Object_Cache {
 		}
 
 		if( $this->can_redis( $group ) ) {
-			$ttl = $this->redis->ttl( "$group:$key" );
+			$ttl = self::$redis->ttl( "$group:$key" );
 			if( $ttl < 0 ) // -1 indicates the key has no ttl
 				$this->set_redis( "$group:$key", $this->cache[ $group ][ $key ] );
 			else if( $ttl == 0 )
@@ -690,16 +717,15 @@ class WP_Object_Cache {
 			$group = 'default';
 		}
 
-		$id = $key;
 		if ( $this->multisite && ! isset( $this->global_groups[ $group ] ) ) {
-			$id = $this->blog_prefix . $key;
+			$key = $this->blog_prefix . $key;
 		}
 
-		if ( ! $this->_exists( $id, $group ) ) {
+		if ( ! $this->_exists( $key, $group ) ) {
 			return false;
 		}
 
-		return $this->set( $key, $data, $group, (int) $expire );
+		return $this->set( $key, $data, $group, (int) $expire, array( 'xx' ) );
 	}
 
 	/**
@@ -719,10 +745,11 @@ class WP_Object_Cache {
 	 * @param int|string $key    What to call the contents in the cache.
 	 * @param mixed      $data   The contents to store in the cache.
 	 * @param string     $group  Optional. Where to group the cache contents. Default 'default'.
-	 * @param int        $expire Not Used.
+	 * @param int        $expire Optional. When to expire the cache contents. Default 0 (no expiration).
+	 * @param array      $redis_options List of options to pass to redis SET command.
 	 * @return true Always returns true.
 	 */
-	public function set( $key, $data, $group = 'default', $expire = 0 ) {
+	public function set( $key, $data, $group = 'default', $expire = 0, $redis_options = array() ) {
 		if ( empty( $group ) ) {
 			$group = 'default';
 		}
@@ -739,7 +766,7 @@ class WP_Object_Cache {
 		$this->cache[ $group ][ $key ] = $data;
 
 		if( $this->can_redis( $group ) )
-			$this->set_redis( "$group:$key", $this->cache[ $group ][ $key ], $expire );
+			$this->set_redis( "$group:$key", $this->cache[ $group ][ $key ], $expire, $redis_options );
 
 		return true;
 	}
@@ -785,10 +812,11 @@ class WP_Object_Cache {
 	 *
 	 * @param int|string $key   Cache key to check for existence.
 	 * @param string     $group Cache group for the key existence check.
+	 * @param bool       $check_redis  Optional. Whether to check Redis if the key exists.
 	 * @return bool Whether the key exists in the cache for the given group.
 	 */
-	protected function _exists( $key, $group ) {
+	protected function _exists( $key, $group, $check_redis = true ) {
 		return ( isset( $this->cache[ $group ] ) && ( isset( $this->cache[ $group ][ $key ] ) || array_key_exists( $key, $this->cache[ $group ] ) ) )
-			|| ( $this->can_redis( $group ) && $this->redis->exists( "$group:$key" ) );
+			|| ( $check_redis && $this->can_redis( $group ) && self::$redis->exists( "$group:$key" ) );
 	}
 }
