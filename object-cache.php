@@ -380,7 +380,7 @@ class WP_Object_Cache {
 	 */
 	protected function can_redis( $group = '' ) {
 		if( !empty( $group ) && isset( $this->non_persistent_groups[ $group ] ) )
-			false;
+			return false;
 
 		return self::$redis_connected;
 	}
@@ -392,16 +392,15 @@ class WP_Object_Cache {
 	 *
 	 * @return bool
 	 */
-	protected function set_redis( $key, $value, $expire = 0, $redis_options = array() ) {
-		if( $expire > 0 )
-			$redis_options['ex'] = $expire;
-
+	protected function set_redis( $key, $value, $expire = 0 ) {
 		$value = @serialize( $value );
 		$compressed_value = @gzcompress( $value, 1, FORCE_DEFLATE );
 		if( false !== $compressed_value )
 			$value = "@$compressed_value"; // @ is our compression marker. The leading character of a php serialized string is never @.
-
-		self::$redis->set( $key, $value, $redis_options );
+		if( $expire > 0 )
+			self::$redis->set( $key, $value, $expire );
+		else
+			self::$redis->set( $key, $value );
 	}
 
 	/**
@@ -497,11 +496,11 @@ class WP_Object_Cache {
 			$id = $this->blog_prefix . $key;
 		}
 
-		if ( $this->_exists( $id, $group, false ) ) {
+		if ( $this->_exists( $id, $group ) ) {
 			return false;
 		}
 
-		return $this->set( $key, $data, $group, (int) $expire, array( 'nx' ) );
+		return $this->set( $key, $data, $group, (int) $expire );
 	}
 
 	/**
@@ -535,7 +534,7 @@ class WP_Object_Cache {
 	 *
 	 * @return bool
 	 */
-	protected function close() {
+	public function close() {
 		if( !empty( self::$redis ) ) {
 			self::$redis->close();
 		}
@@ -577,11 +576,15 @@ class WP_Object_Cache {
 			$key = $this->blog_prefix . $key;
 		}
 
-		$return = isset( $this->cache[ $group ][ $key ] );
+		if ( ! $this->_exists( $key, $group ) ) {
+			return false;
+		}
+
 		unset( $this->cache[ $group ][ $key ] );
+
 		if( $this->can_redis( $group ) )
-			$return = $return || (bool) self::$redis->del( "$group:$key" );
-		return $return;
+			return (bool) self::$redis->del( "$group:$key" );
+		return true;
 	}
 
 	/**
@@ -629,16 +632,18 @@ class WP_Object_Cache {
 			$key = $this->blog_prefix . $key;
 		}
 
-		if ( ( $force || !isset( $this->cache[ $group ][ $key ] ) ) && $this->can_redis( $group ) )
-			$this->cache[ $group ][ $key ] = $this->get_redis( "$group:$key" );
+		if ( $this->_exists( $key, $group ) ) {
+			if ( ( $force || !isset( $this->cache[ $group ][ $key ] ) ) && $this->can_redis( $group ) )
+				$this->cache[ $group ][ $key ] = $this->get_redis( "$group:$key" );
 
-		if ( isset( $this->cache[ $group ][ $key ] ) ) {
-			$found             = true;
-			$this->cache_hits += 1;
-			if ( is_object( $this->cache[ $group ][ $key ] ) ) {
-				return clone $this->cache[ $group ][ $key ];
-			} else {
-				return $this->cache[ $group ][ $key ];
+			if ( isset( $this->cache[ $group ][ $key ] ) ) {
+				$found             = true;
+				$this->cache_hits += 1;
+				if ( is_object( $this->cache[ $group ][ $key ] ) ) {
+					return clone $this->cache[ $group ][ $key ];
+				} else {
+					return $this->cache[ $group ][ $key ];
+				}
 			}
 		}
 
@@ -717,15 +722,16 @@ class WP_Object_Cache {
 			$group = 'default';
 		}
 
+		$id = $key;
 		if ( $this->multisite && ! isset( $this->global_groups[ $group ] ) ) {
-			$key = $this->blog_prefix . $key;
+			$id = $this->blog_prefix . $key;
 		}
 
-		if ( ! $this->_exists( $key, $group ) ) {
+		if ( ! $this->_exists( $id, $group ) ) {
 			return false;
 		}
 
-		return $this->set( $key, $data, $group, (int) $expire, array( 'xx' ) );
+		return $this->set( $key, $data, $group, (int) $expire );
 	}
 
 	/**
@@ -745,11 +751,10 @@ class WP_Object_Cache {
 	 * @param int|string $key    What to call the contents in the cache.
 	 * @param mixed      $data   The contents to store in the cache.
 	 * @param string     $group  Optional. Where to group the cache contents. Default 'default'.
-	 * @param int        $expire Optional. When to expire the cache contents. Default 0 (no expiration).
-	 * @param array      $redis_options List of options to pass to redis SET command.
+	 * @param int        $expire Not Used.
 	 * @return true Always returns true.
 	 */
-	public function set( $key, $data, $group = 'default', $expire = 0, $redis_options = array() ) {
+	public function set( $key, $data, $group = 'default', $expire = 0 ) {
 		if ( empty( $group ) ) {
 			$group = 'default';
 		}
@@ -766,7 +771,7 @@ class WP_Object_Cache {
 		$this->cache[ $group ][ $key ] = $data;
 
 		if( $this->can_redis( $group ) )
-			$this->set_redis( "$group:$key", $this->cache[ $group ][ $key ], $expire, $redis_options );
+			$this->set_redis( "$group:$key", $this->cache[ $group ][ $key ], $expire );
 
 		return true;
 	}
@@ -812,11 +817,10 @@ class WP_Object_Cache {
 	 *
 	 * @param int|string $key   Cache key to check for existence.
 	 * @param string     $group Cache group for the key existence check.
-	 * @param bool       $check_redis  Optional. Whether to check Redis if the key exists.
 	 * @return bool Whether the key exists in the cache for the given group.
 	 */
-	protected function _exists( $key, $group, $check_redis = true ) {
+	protected function _exists( $key, $group ) {
 		return ( isset( $this->cache[ $group ] ) && ( isset( $this->cache[ $group ][ $key ] ) || array_key_exists( $key, $this->cache[ $group ] ) ) )
-			|| ( $check_redis && $this->can_redis( $group ) && self::$redis->exists( "$group:$key" ) );
+			|| ( $this->can_redis( $group ) && self::$redis->exists( "$group:$key" ) );
 	}
 }
