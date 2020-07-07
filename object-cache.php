@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name: Pressjitsu Redis Object Cache
- * Author:      Pressjitsu, Inc., Matthew Sigley, Eric Mann, & Erick Hitter
- * Version:     2.0
+ * Plugin Name: WP Simple Redis Object Cache
+ * Author:      Matthew Sigley
+ * Version:     1.0.0
  */
 
 // Check if Redis class is installed
@@ -73,6 +73,20 @@ function wp_cache_delete( $key, $group = 'default', $time = 0 ) {
 }
 
 /**
+ * Removes cache contents for a given group.
+ *
+ * @param string $group Where the cache contents are grouped
+ * 
+ * @global WP_Object_Cache $wp_object_cache
+ * 
+ * @return bool True on successful removal, false on failure
+ */
+function wp_cache_delete_group( $group ) {
+	global $wp_object_cache;
+	return $wp_object_cache->delete_group( $group );
+}
+
+/**
  * Invalidate all items in the cache.
  *
  * @param int $delay  Number of seconds to wait before invalidating the items.
@@ -100,7 +114,33 @@ function wp_cache_flush( $delay = 0 ) {
  */
 function wp_cache_get( $key, $group = 'default', $force = false, &$found = null ) {
 	global $wp_object_cache;
-	return $wp_object_cache->get( $key, $group, $force, $found );
+
+	$is_alloptions = $key == 'alloptions' && $group = 'options';
+	if( $is_alloptions && $wp_object_cache->cached_alloptions )
+		return array( 0 );
+
+	$return = $wp_object_cache->get( $key, $group, $force, $found );
+
+	if( $is_alloptions && !$wp_object_cache->cached_alloptions && false !== $return  ) {
+		$wp_object_cache->cached_alloptions = true;
+
+		$options_keys = array_keys( $return );
+		$options_values = $wp_object_cache->mget_redis( $return );
+		unset( $return ); // Free up RAM. This is a very large array.
+		$num_options_keys = count( $options_keys );
+		if( empty( $wp_object_cache->cache['options'] ) )
+			$wp_object_cache->cache['options'] = array();
+		for( $i = 0; $i < $num_options_keys; $i++ ) {
+			if( false === $options_values[$i] )
+				continue;
+			
+			$wp_object_cache->cache['options'][$options_keys[$i]] = $options_values[$i];
+		}
+
+		return array( 0 );
+	}
+	
+	return $return;
 }
 
 /**
@@ -220,7 +260,7 @@ class WP_Object_Cache {
 	 * @since 2.0.0
 	 * @var array
 	 */
-	private $cache = array();
+	public $cache = array();
 
 	/**
 	 * The amount of times the cache data was already stored in the cache.
@@ -286,18 +326,26 @@ class WP_Object_Cache {
 	private static $redis = null;
 
 	/**
-	 * Track if Redis is available
-	 *
-	 * @var bool
-	 */
-	private static $redis_persistent_id = null;
-
-	/**
-	 * Track if Redis is available
+	 * Track if Redis is available.
 	 *
 	 * @var bool
 	 */
 	private static $redis_connected = false;
+
+	/**
+	 * Character used at the being of strings to mark the string is compressed.
+	 * SOT is our compression marker. This character is never used in actual text.
+	 * 
+	 * @var char
+	 */
+	private $compression_marker = "\2";
+
+	/**
+	 * If the alloptions cache has been processed.
+	 *
+	 * @var bool
+	 */
+	public $cached_alloptions = false;
 
 	/**
 	 * Instantiate the Redis class.
@@ -362,6 +410,7 @@ class WP_Object_Cache {
 				self::$redis->select( $redis_settings['database'] );
 
 				self::$redis_connected = true;
+
 			} catch ( RedisException $e ) {
 				$this->close();
 			}
@@ -378,7 +427,7 @@ class WP_Object_Cache {
 	 *
 	 * @return bool
 	 */
-	protected function can_redis( $group = '' ) {
+	public function can_redis( $group = '' ) {
 		if( !empty( $group ) && isset( $this->non_persistent_groups[ $group ] ) )
 			return false;
 
@@ -392,11 +441,11 @@ class WP_Object_Cache {
 	 *
 	 * @return bool
 	 */
-	protected function set_redis( $key, $value, $expire = 0 ) {
+	public function set_redis( $key, $value, $expire = 0 ) {
 		$value = @serialize( $value );
 		$compressed_value = @gzcompress( $value, 1, FORCE_DEFLATE );
 		if( false !== $compressed_value )
-			$value = "@$compressed_value"; // @ is our compression marker. The leading character of a php serialized string is never @.
+			$value = "$this->compression_marker$compressed_value";
 		if( $expire > 0 )
 			self::$redis->set( $key, $value, $expire );
 		else
@@ -409,13 +458,28 @@ class WP_Object_Cache {
 	 *
 	 * @return bool
 	 */
-	protected function get_redis( $key ) {
-		$value = self::$redis->get( $key );
-		if( substr( $value, 0, 1 ) == '@' ) {
-			$decompressed_value = @gzuncompress( substr( $value, 1 ) );
-			if( false !== $decompressed_value )
-				$value = $decompressed_value;
-		}
+	public function get_redis( $key ) {
+		return $this->decompress( self::$redis->get( $key ) );
+	}
+
+	/**
+	 * Wrapper for Redis::mget.
+	 * Handle object unserialization and value decompression.
+	 *
+	 * @return bool
+	 */
+	public function mget_redis( $keys ) {
+		return self::$redis->mget( $keys );
+	}
+
+	private function needs_decompressed( $value ) {
+		return is_string( $value ) && substr( $value, 0, 1 ) == $this->compression_marker;
+	}
+
+	private function decompress( $value ) {
+		$decompressed_value = @gzuncompress( substr( $value, 1 ) );
+		if( false !== $decompressed_value )
+			$value = $decompressed_value;
 		return @unserialize( $value );
 	}
 
@@ -588,6 +652,39 @@ class WP_Object_Cache {
 	}
 
 	/**
+	 * Remove the contents of all cache keys in the group.
+	 *
+	 * @param string $group Where the cache contents are grouped.
+	 * @return boolean True on success, false on failure.
+	 */
+	public function delete_group( $group = 'default' ) {
+		if ( empty( $group ) ) {
+			$group = 'default';
+		}
+
+		$key_prefix = '';
+		if ( $this->multisite && ! isset( $this->global_groups[ $group ] ) ) {
+			$key_prefix = $this->blog_prefix;
+			$len_blog_prefix = strlen( $this->blog_prefix );
+			foreach( $this->cache[ $group ] as $key => &$value ) { // &$value prevents looping over copy of array saving memory
+				if( $this->blog_prefix === substr( $key, 0, $len_blog_prefix ) )
+					unset( $this->cache[ $group ][ $key ] );
+			}
+			unset( $value );
+		} else {
+			unset( $this->cache[ $group ] );
+		}
+
+		if( $this->can_redis( $group ) ) {
+			$keys = self::$redis->keys( "$group:$key_prefix*" );
+			if( empty( $keys ) )
+				return false;
+			return (bool) self::$redis->del( ...$keys );
+		}
+		return true;
+	}
+
+	/**
 	 * Clears the object cache of all data.
 	 *
 	 * @since 2.0.0
@@ -639,6 +736,10 @@ class WP_Object_Cache {
 			if ( isset( $this->cache[ $group ][ $key ] ) ) {
 				$found             = true;
 				$this->cache_hits += 1;
+
+				if( 'options' == $group && $this->needs_decompressed( $this->cache[ $group ][ $key ] ) )
+					$this->cache[ $group ][ $key ] = $this->decompress( $this->cache[ $group ][ $key ] );
+
 				if ( is_object( $this->cache[ $group ][ $key ] ) ) {
 					return clone $this->cache[ $group ][ $key ];
 				} else {
@@ -759,6 +860,8 @@ class WP_Object_Cache {
 			$group = 'default';
 		}
 
+		$this->override_cache_value( $key, $value, $group );
+
 		if ( $this->multisite && ! isset( $this->global_groups[ $group ] ) ) {
 			$key = $this->blog_prefix . $key;
 		}
@@ -788,10 +891,16 @@ class WP_Object_Cache {
 		echo '<p>';
 		echo "<strong>Cache Hits:</strong> {$this->cache_hits}<br />";
 		echo "<strong>Cache Misses:</strong> {$this->cache_misses}<br />";
+		if( !empty( $this->cache['options'] ) ) {
+			$compressed_percent = ( count( array_filter( $this->cache['options'], array( $this, 'needs_decompressed' ) ) ) / count( $this->cache['options'] ) ) * 100;
+			$decompressed_percent = 100 - $compressed_percent;
+			echo "<strong>Options Cache Compressed:</strong> " . number_format( $compressed_percent, 2 ) . "%<br />";
+			echo "<strong>Options Cache Decompressed:</strong> " . number_format( $decompressed_percent, 2 ) . "%<br />";
+		}
 		echo '</p>';
 		echo '<ul>';
 		foreach ( $this->cache as $group => $cache ) {
-			echo "<li><strong>Group:</strong> $group - ( " . number_format( strlen( serialize( $cache ) ) / KB_IN_BYTES, 2 ) . 'k )</li>';
+			echo "<li><strong>Group:</strong> $group - ( " . number_format( strlen( serialize( $cache ) ) / 1024, 2 ) . 'k )</li>';
 		}
 		echo '</ul>';
 	}
@@ -822,5 +931,15 @@ class WP_Object_Cache {
 	protected function _exists( $key, $group ) {
 		return ( isset( $this->cache[ $group ] ) && ( isset( $this->cache[ $group ][ $key ] ) || array_key_exists( $key, $this->cache[ $group ] ) ) )
 			|| ( $this->can_redis( $group ) && self::$redis->exists( "$group:$key" ) );
+	}
+
+	public function override_cache_value( $key, &$value, $group ) {
+		if( empty( $value ) )
+			return;
+		if( $key == 'alloptions' && $group = 'options' ) {
+			array_walk( $value, function( &$item, $item_key ) {
+				$item = "options:$item_key";
+			} );
+		}
 	}
 }
