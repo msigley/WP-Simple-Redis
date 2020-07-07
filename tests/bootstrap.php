@@ -11,8 +11,7 @@ $_pj_ocr_tests_dir = __DIR__;
 require_once $_pj_ocr_tests_dir . '/../object-cache.php';
 require_once $_pj_ocr_tests_dir . '/redis-spy.php';
 
-global $wp_object_cache;
-$wp_object_cache = new class {
+class Minimal_WP_Object_Cache {
 	/**
 	 * A minimal sub cache implementation to launch Multisite.
 	 */
@@ -24,6 +23,9 @@ $wp_object_cache = new class {
 	public function get( $k, $g='' ) { return isset( $this->c[ "{$this->b}:$k:$g" ] ) ? $this->c[ "{$this->b}:$k:$g" ] : false; }
 };
 
+
+global $wp_object_cache;
+$wp_object_cache = new Minimal_WP_Object_Cache;
 global $_wp_using_ext_object_cache;
 $_wp_using_ext_object_cache = true;
 
