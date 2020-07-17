@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WP Simple Redis Object Cache
  * Author:      Matthew Sigley
- * Version:     1.0.0
+ * Version:     1.0.1
  */
 
 // Check if Redis class is installed
@@ -898,7 +898,7 @@ class WP_Object_Cache {
 			$group = 'default';
 		}
 
-		$this->override_cache_value( $key, $value, $group );
+		$this->override_cache_value( $key, $data, $group );
 
 		if ( $this->multisite && ! isset( $this->global_groups[ $group ] ) ) {
 			$key = $this->blog_prefix . $key;
